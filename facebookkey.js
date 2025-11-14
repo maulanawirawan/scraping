@@ -4640,10 +4640,11 @@ async function runJob() {
             channel: 'chrome',
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
             permissions: ['clipboard-read', 'clipboard-write'],
-            viewport: { width: 1920, height: 1080 },
+            viewport: null, // ✅ Set to null to use full screen size
             args: [
                 '--disable-blink-features=AutomationControlled',
-                '--enable-clipboard-read-write'
+                '--enable-clipboard-read-write',
+                '--start-maximized' // ✅ Start browser in fullscreen/maximized mode
             ]
         });
         
@@ -4652,8 +4653,10 @@ async function runJob() {
         });
 
         const page = await context.newPage();
+        console.log("🖥️  Browser window set to fullscreen/maximized mode");
+
         await page.goto("https://www.facebook.com/", { waitUntil: 'domcontentloaded' });
-        
+
         let loginSuccess;
         try {
             await page.waitForSelector('a[aria-label="Home"]', { timeout: 5000 });

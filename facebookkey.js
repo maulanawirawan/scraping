@@ -43,6 +43,14 @@ const CONFIG = {
     PREFER_GRAPHQL: true,          // Try GraphQL first
     COMPLEMENT_WITH_HTML: true,    // Use HTML to fill missing fields
 
+    // ✅ Comment Extraction Settings
+    EXTRACT_COMMENTS: true,        // Enable comment extraction
+    MAX_COMMENTS_PER_POST: 50,     // Max parent comments to extract
+    MAX_NESTED_REPLIES: 10,        // Max nested replies per parent comment
+    COMMENT_CSV_FILENAME: "comments.csv",  // Separate CSV for comments
+    COMMENT_HOVER_RETRY: 2,        // Retry count for timestamp hover
+    COMMENT_HOVER_DELAY: 2000,     // Hover delay in ms (increased for better reliability)
+
     // ✅ Resume functionality
     PROGRESS_FILE: './scraping_progress.json',
     CACHE_FILE: './scraped_urls_cache.json',
@@ -1095,6 +1103,10 @@ function getCSVFilename(filterYear) {
 let latestGraphQLResponse = null;
 let graphqlResponseMap = new Map(); // Store responses by cursor/page
 
+// ✅ GraphQL Comment Responses
+let latestCommentGraphQLResponse = null;
+let commentGraphQLResponseMap = new Map(); // Store comment responses by post ID
+
 async function setupGraphQLInterceptor(page) {
     if (!CONFIG.USE_HYBRID_MODE) return;
 
@@ -1108,7 +1120,7 @@ async function setupGraphQLInterceptor(page) {
                 if (contentType.includes('application/json')) {
                     const json = await response.json();
 
-                    // Check if this is a search response
+                    // Check if this is a search response (posts)
                     if (json?.data?.serpResponse?.results) {
                         latestGraphQLResponse = json;
 
@@ -1122,6 +1134,25 @@ async function setupGraphQLInterceptor(page) {
                         }
 
                         trackStrategy('data_source', 'graphql_intercepted');
+                    }
+
+                    // ✅ Check if this is a comment response
+                    if (json?.data?.node?.comment_rendering_instance_for_feed_location?.comments) {
+                        latestCommentGraphQLResponse = json;
+
+                        const commentData = json.data.node.comment_rendering_instance_for_feed_location.comments;
+                        const commentEdges = commentData.edges || [];
+                        const totalComments = commentData.total_count || commentEdges.length;
+
+                        console.log(`      💬 GraphQL Comment Response: ${commentEdges.length} comments (total: ${totalComments})`);
+
+                        // Store by post ID (extract from node ID)
+                        const postId = json.data.node.id;
+                        if (postId) {
+                            commentGraphQLResponseMap.set(postId, json);
+                        }
+
+                        trackStrategy('data_source', 'comment_graphql_intercepted');
                     }
                 }
             }
@@ -1148,6 +1179,8 @@ function extractPostFromGraphQL(story, edgeData) {
             // Author
             author: story.actors?.[0]?.name || story.feedback?.owning_profile?.name || 'N/A',
             author_id: story.actors?.[0]?.id || story.feedback?.owning_profile?.id || 'N/A',
+            author_url: story.actors?.[0]?.url || (story.actors?.[0]?.id ? `https://www.facebook.com/${story.actors?.[0]?.id}` : 'N/A'),
+            author_followers: story.actors?.[0]?.subscribers?.count || story.feedback?.owning_profile?.subscribers?.count || 0,
 
             // Content
             content_text: story.message?.text || '',
@@ -1251,7 +1284,7 @@ function mergeDataSources(graphqlData, htmlData) {
 
     // For each field, use GraphQL if available and not empty, otherwise use HTML
     const fields = [
-        'author', 'author_id', 'content_text', 'timestamp', 'timestamp_iso',
+        'author', 'author_id', 'author_url', 'author_followers', 'content_text', 'timestamp', 'timestamp_iso',
         'post_url', 'share_url', 'image_url', 'image_source', 'video_url', 'video_source',
         'reactions_total', 'comments', 'shares', 'views', 'location'
     ];
@@ -1308,6 +1341,403 @@ function findGraphQLPostByUrl(url) {
     }
 
     return null;
+}
+
+// ============================================================================
+// ✅ COMMENT EXTRACTION FUNCTIONS (Hybrid: GraphQL + HTML)
+// ============================================================================
+
+/**
+ * ✅ Parse Comments from GraphQL Response
+ * Extracts up to MAX_COMMENTS_PER_POST parent comments and MAX_NESTED_REPLIES per comment
+ */
+function parseCommentsFromGraphQL(graphqlResponse, postUrl, postAuthor) {
+    if (!graphqlResponse) return [];
+
+    const comments = [];
+
+    try {
+        const commentData = graphqlResponse?.data?.node?.comment_rendering_instance_for_feed_location?.comments;
+        if (!commentData || !commentData.edges) return [];
+
+        const edges = commentData.edges || [];
+        let parentCount = 0;
+
+        for (const edge of edges) {
+            const node = edge.node;
+            if (!node) continue;
+
+            // Only process parent comments (depth 0) up to the limit
+            if (node.depth === 0 && parentCount >= CONFIG.MAX_COMMENTS_PER_POST) {
+                break;
+            }
+
+            // Skip if depth > 0 and we've already hit the nested reply limit
+            // (This will be handled when we process replies)
+            if (node.depth > 0) continue;
+
+            // Extract parent comment
+            const comment = {
+                post_url: postUrl,
+                post_author: postAuthor,
+                comment_id: node.legacy_fbid || node.id,
+                comment_author: node.author?.name || 'Unknown',
+                comment_author_url: node.author?.url || `https://www.facebook.com/${node.author?.id || 'unknown'}`,
+                comment_text: cleanTextForCSV(node.body?.text || ''),
+                comment_timestamp: node.created_time
+                    ? new Date(node.created_time * 1000).toISOString()
+                    : 'N/A',
+                comment_timestamp_unix: node.created_time || 0,
+                comment_reactions: node.feedback?.reactors?.count || 0,
+                comment_replies_count: node.feedback?.replies_fields?.total_count || 0,
+                comment_depth: node.depth || 0,
+                data_source: 'graphql'
+            };
+
+            comments.push(comment);
+            parentCount++;
+
+            // Extract nested replies (up to MAX_NESTED_REPLIES)
+            const repliesConnection = node.feedback?.replies_connection;
+            if (repliesConnection && repliesConnection.edges) {
+                const replyEdges = repliesConnection.edges.slice(0, CONFIG.MAX_NESTED_REPLIES);
+
+                for (const replyEdge of replyEdges) {
+                    const replyNode = replyEdge.node;
+                    if (!replyNode) continue;
+
+                    const reply = {
+                        post_url: postUrl,
+                        post_author: postAuthor,
+                        comment_id: replyNode.legacy_fbid || replyNode.id,
+                        comment_author: replyNode.author?.name || 'Unknown',
+                        comment_author_url: replyNode.author?.url || `https://www.facebook.com/${replyNode.author?.id || 'unknown'}`,
+                        comment_text: cleanTextForCSV(replyNode.body?.text || ''),
+                        comment_timestamp: replyNode.created_time
+                            ? new Date(replyNode.created_time * 1000).toISOString()
+                            : 'N/A',
+                        comment_timestamp_unix: replyNode.created_time || 0,
+                        comment_reactions: replyNode.feedback?.reactors?.count || 0,
+                        comment_replies_count: 0, // Nested replies don't have sub-replies
+                        comment_depth: replyNode.depth || 1,
+                        data_source: 'graphql'
+                    };
+
+                    comments.push(reply);
+                }
+            }
+        }
+
+        console.log(`      💬 GraphQL: Extracted ${comments.filter(c => c.comment_depth === 0).length} parent comments, ${comments.filter(c => c.comment_depth > 0).length} replies`);
+        trackStrategy('comments', 'graphql_extracted');
+
+        return comments;
+
+    } catch (err) {
+        console.warn(`      ⚠️ GraphQL comment parsing error: ${err.message}`);
+        trackStrategy('comments', 'graphql_parse_error');
+        return [];
+    }
+}
+
+/**
+ * ✅ Extract Comments from HTML (Fallback method)
+ * Based on facebookakon.js logic
+ */
+async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
+    const comments = [];
+
+    try {
+        console.log(`      💬 HTML: Starting comment extraction...`);
+
+        // Step 1: Click comment button to open dialog
+        const commentButtonSelectors = [
+            'span.xkrqix3.x1sur9pj:has-text("comments")',
+            'div.x1i10hfl[role="button"]:has(span.xkrqix3.x1sur9pj:has-text("comments"))',
+            'div[role="button"]:has(span:has-text("comments"))',
+            'span:has-text("comments")',
+        ];
+
+        let dialogOpened = false;
+
+        for (const selector of commentButtonSelectors) {
+            try {
+                const commentBtn = postEl.locator(selector).first();
+
+                if (await commentBtn.count() > 0) {
+                    await commentBtn.scrollIntoViewIfNeeded().catch(() => {});
+                    await page.waitForTimeout(500);
+
+                    const parentButton = postEl.locator('div[role="button"]:has(span:has-text("comments"))').first();
+
+                    if (await parentButton.count() > 0) {
+                        await parentButton.click({ timeout: 5000 });
+                        await page.waitForTimeout(3000);
+
+                        // Verify dialog opened
+                        const dialog = page.locator('div[role="dialog"]').first();
+                        if (await dialog.count() > 0) {
+                            dialogOpened = true;
+                            break;
+                        }
+                    }
+                }
+            } catch (e) {
+                continue;
+            }
+        }
+
+        if (!dialogOpened) {
+            console.log(`      ℹ️  HTML: No comment dialog opened`);
+            trackStrategy('comments', 'html_no_dialog');
+            return [];
+        }
+
+        // Step 2: Wait for comments to load
+        await page.waitForTimeout(2000);
+
+        // Step 3: Scroll in dialog to load more comments (up to 50)
+        const dialog = page.locator('div[role="dialog"]').first();
+        const scrollContainer = dialog.locator('div[role="article"]').first();
+
+        let previousCount = 0;
+        let scrollAttempts = 0;
+        const maxScrollAttempts = 10; // Limit scrolling attempts
+
+        while (scrollAttempts < maxScrollAttempts) {
+            const currentComments = await dialog.locator('div[role="article"][aria-label*="Comment by"]').count();
+
+            if (currentComments >= CONFIG.MAX_COMMENTS_PER_POST) {
+                console.log(`      ℹ️  HTML: Reached max comments limit (${CONFIG.MAX_COMMENTS_PER_POST})`);
+                break;
+            }
+
+            if (currentComments === previousCount) {
+                scrollAttempts++;
+            } else {
+                scrollAttempts = 0; // Reset if we found new comments
+                previousCount = currentComments;
+            }
+
+            // Scroll to load more
+            try {
+                await dialog.evaluate((el) => {
+                    el.scrollTop = el.scrollHeight;
+                });
+                await page.waitForTimeout(1500);
+            } catch (e) {
+                break;
+            }
+        }
+
+        // Step 4: Extract visible comments
+        const commentContainers = await dialog.locator('div[role="article"][aria-label*="Comment by"]').all();
+        const maxComments = Math.min(commentContainers.length, CONFIG.MAX_COMMENTS_PER_POST);
+
+        for (let i = 0; i < maxComments; i++) {
+            const commentEl = commentContainers[i];
+
+            try {
+                const comment = {
+                    post_url: postUrl,
+                    post_author: postAuthor,
+                    comment_id: 'N/A',
+                    comment_author: 'Unknown',
+                    comment_author_url: 'N/A',
+                    comment_text: '',
+                    comment_timestamp: 'N/A',
+                    comment_timestamp_unix: 0,
+                    comment_reactions: 0,
+                    comment_replies_count: 0,
+                    comment_depth: 0,
+                    data_source: 'html'
+                };
+
+                // Extract author
+                const authorEl = commentEl.locator('a[role="link"] span.x193iq5w.xeuugli').first();
+                if (await authorEl.count() > 0) {
+                    comment.comment_author = (await authorEl.textContent()).trim();
+                }
+
+                // Extract author URL
+                const authorLink = commentEl.locator('a[role="link"]').first();
+                if (await authorLink.count() > 0) {
+                    comment.comment_author_url = await authorLink.getAttribute('href');
+                    if (comment.comment_author_url && !comment.comment_author_url.startsWith('http')) {
+                        comment.comment_author_url = 'https://www.facebook.com' + comment.comment_author_url;
+                    }
+                }
+
+                // Extract text
+                const textDivs = await commentEl.locator('div.x1lliihq.xjkvuk6.x1iorvi4 div[dir="auto"]').all();
+                const textParts = [];
+                for (const div of textDivs) {
+                    const text = await div.textContent();
+                    if (text && text.trim()) {
+                        textParts.push(text.trim());
+                    }
+                }
+                comment.comment_text = cleanTextForCSV(textParts.join(' '));
+
+                // Extract timestamp with retry
+                for (let retry = 0; retry <= CONFIG.COMMENT_HOVER_RETRY; retry++) {
+                    try {
+                        const timestampEl = commentEl.locator('a[role="link"]:has(span)').nth(1);
+                        if (await timestampEl.count() > 0) {
+                            await timestampEl.hover({ timeout: 3000 });
+                            await page.waitForTimeout(CONFIG.COMMENT_HOVER_DELAY);
+
+                            const tooltip = page.locator('div[role="tooltip"]').first();
+                            if (await tooltip.count() > 0) {
+                                const tooltipText = await tooltip.textContent();
+                                comment.comment_timestamp = tooltipText.trim();
+                                break;
+                            }
+                        }
+                    } catch (e) {
+                        if (retry === CONFIG.COMMENT_HOVER_RETRY) {
+                            // Fallback: get relative timestamp
+                            const relativeTime = await commentEl.locator('a[role="link"] span').nth(1).textContent().catch(() => 'N/A');
+                            comment.comment_timestamp = relativeTime;
+                        }
+                        await page.waitForTimeout(500);
+                    }
+                }
+
+                // Extract reactions
+                const reactionEl = commentEl.locator('span[aria-label*="reaction"]').first();
+                if (await reactionEl.count() > 0) {
+                    const ariaLabel = await reactionEl.getAttribute('aria-label');
+                    const match = ariaLabel?.match(/(\d+)/);
+                    if (match) {
+                        comment.comment_reactions = parseInt(match[1]);
+                    }
+                }
+
+                // Extract reply count
+                const replyEl = commentEl.locator('span:has-text("repl")').first();
+                if (await replyEl.count() > 0) {
+                    const replyText = await replyEl.textContent();
+                    const match = replyText?.match(/(\d+)/);
+                    if (match) {
+                        comment.comment_replies_count = parseInt(match[1]);
+                    }
+                }
+
+                if (comment.comment_text) {
+                    comments.push(comment);
+                }
+
+            } catch (err) {
+                console.warn(`      ⚠️ HTML: Error extracting comment ${i + 1}: ${err.message}`);
+            }
+        }
+
+        // Close dialog
+        try {
+            const closeBtn = dialog.locator('div[aria-label="Close"]').first();
+            if (await closeBtn.count() > 0) {
+                await closeBtn.click({ timeout: 3000 });
+                await page.waitForTimeout(1000);
+            }
+        } catch (e) {
+            // Press Escape as fallback
+            await page.keyboard.press('Escape').catch(() => {});
+        }
+
+        console.log(`      💬 HTML: Extracted ${comments.length} comments`);
+        trackStrategy('comments', 'html_extracted');
+
+        return comments;
+
+    } catch (err) {
+        console.warn(`      ⚠️ HTML comment extraction error: ${err.message}`);
+        trackStrategy('comments', 'html_extraction_error');
+        return [];
+    }
+}
+
+/**
+ * ✅ Extract All Comments - Hybrid Mode (GraphQL first, HTML fallback)
+ */
+async function extractAllCommentsHybrid(page, postEl, postUrl, postAuthor, postId) {
+    if (!CONFIG.EXTRACT_COMMENTS) return [];
+
+    console.log(`      💬 Extracting comments (hybrid mode)...`);
+
+    let comments = [];
+
+    // Try GraphQL first
+    if (CONFIG.PREFER_GRAPHQL && latestCommentGraphQLResponse) {
+        comments = parseCommentsFromGraphQL(latestCommentGraphQLResponse, postUrl, postAuthor);
+
+        if (comments.length > 0) {
+            console.log(`      ✅ Using GraphQL comments (${comments.length} total)`);
+            trackStrategy('comments', 'hybrid_graphql_success');
+            return comments;
+        }
+    }
+
+    // Fallback to HTML if GraphQL didn't work
+    if (CONFIG.COMPLEMENT_WITH_HTML) {
+        console.log(`      ℹ️  GraphQL comments not available, trying HTML extraction...`);
+        comments = await extractCommentsFromHTML(page, postEl, postUrl, postAuthor);
+
+        if (comments.length > 0) {
+            console.log(`      ✅ Using HTML comments (${comments.length} total)`);
+            trackStrategy('comments', 'hybrid_html_fallback');
+            return comments;
+        }
+    }
+
+    console.log(`      ℹ️  No comments extracted`);
+    trackStrategy('comments', 'hybrid_no_comments');
+    return [];
+}
+
+/**
+ * ✅ Save Comments to CSV (Realtime)
+ */
+async function saveCommentsRealtime(comments, commentFile) {
+    if (comments.length === 0) return;
+
+    try {
+        const fileExists = fs.existsSync(commentFile);
+
+        // Write BOM for Excel compatibility (only if new file)
+        if (!fileExists) {
+            fs.writeFileSync(commentFile, '\ufeff');
+        }
+
+        const commentWriter = createObjectCsvWriter({
+            path: commentFile,
+            header: [
+                {id: 'post_author', title: 'post_author'},
+                {id: 'post_url', title: 'post_url'},
+                {id: 'comment_id', title: 'comment_id'},
+                {id: 'comment_author', title: 'comment_author'},
+                {id: 'comment_author_url', title: 'comment_author_url'},
+                {id: 'comment_text', title: 'comment_text'},
+                {id: 'comment_timestamp', title: 'comment_timestamp'},
+                {id: 'comment_timestamp_unix', title: 'comment_timestamp_unix'},
+                {id: 'comment_reactions', title: 'comment_reactions'},
+                {id: 'comment_replies_count', title: 'comment_replies_count'},
+                {id: 'comment_depth', title: 'comment_depth'},
+                {id: 'data_source', title: 'data_source'}
+            ],
+            append: fileExists,
+            alwaysQuote: true,
+            encoding: 'utf8',
+            fieldDelimiter: ',',
+        });
+
+        await commentWriter.writeRecords(comments);
+        fs.chmodSync(commentFile, CONFIG.FILE_PERMISSIONS);
+
+        console.log(`      💾 Saved ${comments.length} comments to ${commentFile}`);
+    } catch (error) {
+        console.warn(`      ⚠️ Comment save error: ${error.message}`);
+    }
 }
 
 /**
@@ -4005,6 +4435,8 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
                     // ✅ HYBRID MODE: Prepare HTML data
                     let htmlData = {
                         author: authorName,
+                        author_url: 'N/A', // Will be filled by GraphQL if available
+                        author_followers: 0, // Will be filled by GraphQL if available
                         location: location,
                         timestamp: postTimestamp,
                         timestamp_iso: convertToISO(postTimestamp),
@@ -4091,6 +4523,26 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
                     // ✅ REALTIME SAVE: Save immediately after extraction
                     const csvFilename = getCSVFilename(filterYear);
                     await savePostRealtime(finalPost, csvFilename);
+
+                    // ✅ COMMENT EXTRACTION: Extract comments for this post
+                    if (CONFIG.EXTRACT_COMMENTS) {
+                        try {
+                            const commentFilename = path.join(CONFIG.csv_base_folder, CONFIG.COMMENT_CSV_FILENAME);
+                            const extractedComments = await extractAllCommentsHybrid(
+                                page,
+                                postEl,
+                                postUrl,
+                                authorName,
+                                postId
+                            );
+
+                            if (extractedComments.length > 0) {
+                                await saveCommentsRealtime(extractedComments, commentFilename);
+                            }
+                        } catch (commentError) {
+                            console.warn(`      ⚠️ Comment extraction error: ${commentError.message}`);
+                        }
+                    }
 
                     // ✅ VISUAL HIGHLIGHT: Mark as successfully saved
                     await highlightPost(page, postEl, 'success');
@@ -4198,6 +4650,8 @@ async function savePostRealtime(post, postFile) {
             path: postFile,
             header: [
                 {id: 'author', title: 'author'},
+                {id: 'author_url', title: 'author_url'},
+                {id: 'author_followers', title: 'author_followers'},
                 {id: 'location', title: 'location'},
                 {id: 'timestamp', title: 'timestamp'},
                 {id: 'timestamp_iso', title: 'timestamp_iso'},
@@ -4280,6 +4734,8 @@ async function saveData(posts, postFile) {
             path: postFile,
             header: [
                 {id: 'author', title: 'author'},
+                {id: 'author_url', title: 'author_url'},
+                {id: 'author_followers', title: 'author_followers'},
                 {id: 'location', title: 'location'},
                 {id: 'timestamp', title: 'timestamp'},
                 {id: 'timestamp_iso', title: 'timestamp_iso'},
@@ -5632,6 +6088,8 @@ async function processOrphanURLs(context, maxToProcess = 50) {
                 // ========== CREATE POST OBJECT ==========
                 const post = {
                     author: authorName,
+                    author_url: 'N/A',
+                    author_followers: 0,
                     location: location,
                     timestamp: postTimestamp,
                     timestamp_iso: timestampISO,

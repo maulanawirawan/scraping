@@ -38,6 +38,11 @@ const CONFIG = {
     // Debug & Filter
     DEBUG_MODE: false,
 
+    // ✅ Hybrid Mode: GraphQL API + HTML Scraping
+    USE_HYBRID_MODE: true,        // Enable GraphQL + HTML hybrid
+    PREFER_GRAPHQL: true,          // Try GraphQL first
+    COMPLEMENT_WITH_HTML: true,    // Use HTML to fill missing fields
+
     // ✅ Resume functionality
     PROGRESS_FILE: './scraping_progress.json',
     CACHE_FILE: './scraped_urls_cache.json',
@@ -97,7 +102,8 @@ const strategyStats = {
     location: {},
     url: {},
     author: {},
-    content: {}
+    content: {},
+    data_source: {}  // ✅ NEW: Track GraphQL vs HTML
 };
 
 let totalPostsProcessed = 0; // Track total posts untuk report
@@ -1079,6 +1085,229 @@ function getCSVFilename(filterYear) {
         return path.join(CONFIG.csv_base_folder, CONFIG.csv_recent_filename);
     }
     return path.join(CONFIG.csv_base_folder, `${CONFIG.csv_historical_prefix}${filterYear}.csv`);
+}
+
+// ======== ✅ GRAPHQL HYBRID MODE FUNCTIONS ========
+
+/**
+ * ✅ Setup GraphQL Response Interceptor
+ */
+let latestGraphQLResponse = null;
+let graphqlResponseMap = new Map(); // Store responses by cursor/page
+
+async function setupGraphQLInterceptor(page) {
+    if (!CONFIG.USE_HYBRID_MODE) return;
+
+    console.log('📡 Setting up GraphQL interceptor...');
+
+    page.on('response', async (response) => {
+        try {
+            if (response.url().includes('/api/graphql/') && response.status() === 200) {
+                const contentType = response.headers()['content-type'] || '';
+
+                if (contentType.includes('application/json')) {
+                    const json = await response.json();
+
+                    // Check if this is a search response
+                    if (json?.data?.serpResponse?.results) {
+                        latestGraphQLResponse = json;
+
+                        const edges = json.data.serpResponse.results.edges || [];
+                        console.log(`      📥 GraphQL Response: ${edges.length} posts`);
+
+                        // Store by cursor for pagination
+                        const cursor = json.data.serpResponse.results.page_info?.end_cursor;
+                        if (cursor) {
+                            graphqlResponseMap.set(cursor, json);
+                        }
+
+                        trackStrategy('data_source', 'graphql_intercepted');
+                    }
+                }
+            }
+        } catch (err) {
+            // Silent fail - not all responses are JSON
+        }
+    });
+}
+
+/**
+ * ✅ Extract Post Data from GraphQL Response
+ */
+function extractPostFromGraphQL(story, edgeData) {
+    if (!story) return null;
+
+    try {
+        const feedback = story.feedback?.comet_ufi_summary_and_actions_renderer?.feedback;
+        const metadata = story.comet_sections?.context_layout?.story?.comet_sections?.metadata?.[0]?.story;
+
+        const data = {
+            // IDs
+            post_id: story.post_id || story.id,
+
+            // Author
+            author: story.actors?.[0]?.name || story.feedback?.owning_profile?.name || 'N/A',
+            author_id: story.actors?.[0]?.id || story.feedback?.owning_profile?.id || 'N/A',
+
+            // Content
+            content_text: story.message?.text || '',
+
+            // Timestamp (Unix to ISO)
+            timestamp_unix: metadata?.creation_time,
+            timestamp: metadata?.creation_time
+                ? new Date(metadata.creation_time * 1000).toISOString()
+                : 'N/A',
+            timestamp_iso: metadata?.creation_time
+                ? new Date(metadata.creation_time * 1000).toISOString()
+                : 'N/A',
+
+            // URLs
+            post_url: story.url || story.wwwURL || 'N/A',
+            share_url: story.url || story.wwwURL || 'N/A',
+
+            // Attachments - Images
+            attachments: story.attachments || [],
+            image_url: 'N/A',
+            image_source: 'N/A',
+            image_count: 0,
+
+            // Attachments - Videos
+            video_url: 'N/A',
+            video_source: 'N/A',
+
+            // Engagement
+            reactions_total: feedback?.reaction_count?.count || 0,
+            comments: feedback?.comment_rendering_instance?.comments?.total_count || 0,
+            shares: feedback?.share_count?.count || 0,
+            views: 0, // Need to get from video attachments
+
+            // Other
+            location: 'N/A',
+            privacy: story.comet_sections?.context_layout?.story?.privacy_scope?.description || 'N/A',
+
+            // Meta
+            data_source: 'graphql'
+        };
+
+        // Extract image URLs
+        if (data.attachments.length > 0) {
+            const firstAttachment = data.attachments[0];
+            const subAttachments = firstAttachment.styles?.attachment?.all_subattachments;
+
+            if (subAttachments) {
+                data.image_count = subAttachments.count || 0;
+
+                if (subAttachments.nodes && subAttachments.nodes.length > 0) {
+                    const firstNode = subAttachments.nodes[0];
+                    data.image_source = firstNode.media?.image?.uri || 'N/A';
+                    data.image_url = firstNode.url || firstAttachment.styles?.attachment?.url || 'N/A';
+                }
+            }
+
+            // Check for video
+            if (firstAttachment.media?.__typename === 'Video') {
+                data.video_url = firstAttachment.media?.playable_url || 'N/A';
+                data.video_source = firstAttachment.media?.browser_native_sd_url || firstAttachment.media?.playable_url || 'N/A';
+                data.views = firstAttachment.media?.video_view_count || 0;
+            }
+        }
+
+        return data;
+
+    } catch (err) {
+        console.warn(`      ⚠️ GraphQL extraction error: ${err.message}`);
+        return null;
+    }
+}
+
+/**
+ * ✅ Get GraphQL Data for Current Posts
+ */
+function getGraphQLDataForPosts() {
+    if (!latestGraphQLResponse) return [];
+
+    const edges = latestGraphQLResponse?.data?.serpResponse?.results?.edges || [];
+    const posts = [];
+
+    for (const edge of edges) {
+        const story = edge?.rendering_strategy?.view_model?.click_model?.story;
+        if (story) {
+            const postData = extractPostFromGraphQL(story, edge);
+            if (postData) {
+                posts.push(postData);
+            }
+        }
+    }
+
+    return posts;
+}
+
+/**
+ * ✅ Merge GraphQL + HTML Data (Best of Both Worlds)
+ */
+function mergeDataSources(graphqlData, htmlData) {
+    const merged = { ...htmlData };
+    const sources = {};
+
+    // For each field, use GraphQL if available and not empty, otherwise use HTML
+    const fields = [
+        'author', 'author_id', 'content_text', 'timestamp', 'timestamp_iso',
+        'post_url', 'share_url', 'image_url', 'image_source', 'video_url', 'video_source',
+        'reactions_total', 'comments', 'shares', 'views', 'location'
+    ];
+
+    for (const field of fields) {
+        const graphqlValue = graphqlData?.[field];
+        const htmlValue = htmlData?.[field];
+
+        // Determine which value to use
+        const graphqlValid = graphqlValue && graphqlValue !== 'N/A' && graphqlValue !== 0;
+        const htmlValid = htmlValue && htmlValue !== 'N/A' && htmlValue !== 0;
+
+        if (CONFIG.PREFER_GRAPHQL && graphqlValid) {
+            merged[field] = graphqlValue;
+            sources[field] = 'graphql';
+            trackStrategy('data_source', `${field}_from_graphql`);
+        } else if (htmlValid) {
+            merged[field] = htmlValue;
+            sources[field] = 'html';
+            trackStrategy('data_source', `${field}_from_html`);
+        } else if (graphqlValid) {
+            merged[field] = graphqlValue;
+            sources[field] = 'graphql';
+            trackStrategy('data_source', `${field}_from_graphql`);
+        } else {
+            merged[field] = htmlValue || 'N/A';
+            sources[field] = htmlValue ? 'html' : 'missing';
+            trackStrategy('data_source', `${field}_missing`);
+        }
+    }
+
+    // Add meta info
+    merged.data_sources = sources;
+    merged.hybrid_mode = true;
+
+    return merged;
+}
+
+/**
+ * ✅ Find GraphQL Post by URL or ID
+ */
+function findGraphQLPostByUrl(url) {
+    const graphqlPosts = getGraphQLDataForPosts();
+
+    for (const post of graphqlPosts) {
+        if (post.post_url === url || post.share_url === url) {
+            return post;
+        }
+
+        // Try matching by post_id
+        if (url.includes(post.post_id)) {
+            return post;
+        }
+    }
+
+    return null;
 }
 
 /**
@@ -2893,7 +3122,13 @@ async function handleTranslatedContent(page, postEl) {
 async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
     const yearLabel = filterYear ? ` (Year: ${filterYear})` : ' (Recent Posts Mode)';
     console.log(`🔍 Memulai pencarian: "${query}"${yearLabel} (Target: ${maxPosts} posts)`);
-    
+
+    // ✅ HYBRID MODE: Setup GraphQL interceptor if enabled
+    if (CONFIG.USE_HYBRID_MODE) {
+        console.log(`   🔄 Hybrid Mode: Enabled (GraphQL API + HTML Scraping)`);
+        await setupGraphQLInterceptor(page);
+    }
+
     let postsData = [];
     let scrollTanpaHasil = 0;
 
@@ -3767,7 +4002,8 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
                     // ========== SAVE POST DATA ==========
                     const scraped_at = new Date().toISOString();
 
-                    const post = {
+                    // ✅ HYBRID MODE: Prepare HTML data
+                    let htmlData = {
                         author: authorName,
                         location: location,
                         timestamp: postTimestamp,
@@ -3789,6 +4025,38 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
                         updated_at: scraped_at
                     };
 
+                    // ✅ HYBRID MODE: Try to merge with GraphQL data
+                    let post = htmlData;
+                    if (CONFIG.USE_HYBRID_MODE && latestGraphQLResponse) {
+                        const graphqlPost = findGraphQLPostByUrl(latestGraphQLResponse, postUrl);
+
+                        if (graphqlPost) {
+                            console.log(`      🔄 GraphQL data found! Merging with HTML data...`);
+                            post = mergeDataSources(graphqlPost, htmlData);
+
+                            // Show which source was used for key fields
+                            const sources = [];
+                            if (post._data_sources) {
+                                if (post._data_sources.author) sources.push(`Author:${post._data_sources.author === 'graphql' ? 'API' : 'HTML'}`);
+                                if (post._data_sources.timestamp_iso) sources.push(`Time:${post._data_sources.timestamp_iso === 'graphql' ? 'API' : 'HTML'}`);
+                                if (post._data_sources.content_text) sources.push(`Text:${post._data_sources.content_text === 'graphql' ? 'API' : 'HTML'}`);
+                                if (post._data_sources.reactions_total) sources.push(`React:${post._data_sources.reactions_total === 'graphql' ? 'API' : 'HTML'}`);
+                            }
+
+                            if (sources.length > 0) {
+                                console.log(`      📊 Data Sources: ${sources.join(', ')}`);
+                            }
+
+                            // Remove internal tracking field before saving
+                            delete post._data_sources;
+                        } else if (CONFIG.PREFER_GRAPHQL) {
+                            console.log(`      ℹ️  No GraphQL match, using HTML data`);
+                            trackStrategy('data_source', 'html_only');
+                        }
+                    }
+
+                    const finalPost = post;
+
                     // ========== ✅ MARK AS SCRAPED - MULTIPLE KEYS ==========
                     allScrapedUrls.add(postUrl);
 
@@ -3806,7 +4074,7 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
                     const finalHash = generateContentFingerprint(authorName, postTimestamp, contentText, actualImageUrl);
                     allScrapedUrls.add(`hash:${finalHash}`);
 
-                    postsData.push(post);
+                    postsData.push(finalPost);
                     newPostsInLoop++;
 
                     allScrapedUrls.add(postUrl);
@@ -3822,7 +4090,7 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
 
                     // ✅ REALTIME SAVE: Save immediately after extraction
                     const csvFilename = getCSVFilename(filterYear);
-                    await savePostRealtime(post, csvFilename);
+                    await savePostRealtime(finalPost, csvFilename);
 
                     // ✅ VISUAL HIGHLIGHT: Mark as successfully saved
                     await highlightPost(page, postEl, 'success');

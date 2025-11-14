@@ -1,3 +1,8 @@
 facebook_graphql_structure.txt
+
+# Test output files
 extracted-posts.csv
 extracted-posts.json
+
+# Captured data directory
+captured-data/

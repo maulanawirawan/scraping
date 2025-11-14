@@ -837,48 +837,61 @@ function convertToISO(dateString) {
     }
     
     try {
-        // ✅ NEW PATTERN: Handle day name di depan
+        // ✅ ENHANCED PATTERNS: Handle with and without time
         const patterns = [
+            // WITH TIME:
             // "Monday 6 October 2025 at 15:37"
-            /(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?\s*(\d{1,2})\s+(\w+)\s+(\d{4})\s+at\s+(\d{1,2}):(\d{2})/i,
-            // "6 October 2025 at 15:37" (fallback)
-            /(\d{1,2})\s+(\w+)\s+(\d{4})\s+at\s+(\d{1,2}):(\d{2})/i,
+            { regex: /(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?\s*(\d{1,2})\s+(\w+)\s+(\d{4})\s+at\s+(\d{1,2}):(\d{2})/i, hasTime: true, format: 'day-month' },
+            // "6 October 2025 at 15:37"
+            { regex: /(\d{1,2})\s+(\w+)\s+(\d{4})\s+at\s+(\d{1,2}):(\d{2})/i, hasTime: true, format: 'day-month' },
             // "October 6, 2025 at 15:37" (US format)
-            /(\w+)\s+(\d{1,2}),?\s+(\d{4})\s+at\s+(\d{1,2}):(\d{2})/i,
+            { regex: /(\w+)\s+(\d{1,2}),?\s+(\d{4})\s+at\s+(\d{1,2}):(\d{2})/i, hasTime: true, format: 'month-day' },
+
+            // WITHOUT TIME (use 00:00:00 as default):
+            // "22 December 2023"
+            { regex: /^(\d{1,2})\s+(\w+)\s+(\d{4})$/i, hasTime: false, format: 'day-month' },
+            // "December 22, 2023" (US format)
+            { regex: /^(\w+)\s+(\d{1,2}),?\s+(\d{4})$/i, hasTime: false, format: 'month-day' },
+            // "Monday 22 December 2023"
+            { regex: /(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+(\d{1,2})\s+(\w+)\s+(\d{4})$/i, hasTime: false, format: 'day-month' },
         ];
-        
+
         let match = null;
-        let patternIndex = 0;
-        
-        for (let i = 0; i < patterns.length; i++) {
-            match = dateString.match(patterns[i]);
+        let matchedPattern = null;
+
+        for (const pattern of patterns) {
+            match = dateString.match(pattern.regex);
             if (match) {
-                patternIndex = i;
+                matchedPattern = pattern;
                 break;
             }
         }
-        
+
         if (!match) {
             console.warn(`   ⚠️ Could not parse date: ${dateString}`);
             return null;
         }
-        
-        let day, monthName, year, hour, minute;
-        
-        if (patternIndex === 2) {
+
+        let day, monthName, year, hour = '00', minute = '00';
+
+        if (matchedPattern.format === 'month-day') {
             // US format: month day year
             monthName = match[1];
             day = match[2];
             year = match[3];
-            hour = match[4];
-            minute = match[5];
+            if (matchedPattern.hasTime) {
+                hour = match[4];
+                minute = match[5];
+            }
         } else {
             // Normal format: day month year
             day = match[1];
             monthName = match[2];
             year = match[3];
-            hour = match[4];
-            minute = match[5];
+            if (matchedPattern.hasTime) {
+                hour = match[4];
+                minute = match[5];
+            }
         }
         
         const months = {

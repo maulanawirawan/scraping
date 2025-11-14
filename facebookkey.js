@@ -37,6 +37,10 @@ const CONFIG = {
     
     // Debug & Filter
     DEBUG_MODE: false,
+
+    // ✅ Resume functionality
+    PROGRESS_FILE: './scraping_progress.json',
+    CACHE_FILE: './scraped_urls_cache.json',
     USE_DATE_FILTER: true,
     FILTER_YEARS: [2023, 2024, 2025],
     SKIP_HISTORICAL: false,
@@ -74,6 +78,14 @@ const CONFIG = {
 let isJobRunning = false;
 let allScrapedUrls = new Set();
 let isFirstRunDone = false;
+
+// ✅ RESUME STATE
+let resumeState = {
+    currentQueryIndex: 0,
+    currentYearIndex: 0,
+    inHistoricalMode: false,
+    lastSavedAt: null
+};
 
 // ======== ✅ STRATEGY TRACKING SYSTEM - AUTO UPDATE ========
 const strategyStats = {
@@ -242,6 +254,102 @@ Legend:
         
     } catch (e) {
         console.error(`❌ Failed to save strategy report: ${e.message}`);
+    }
+}
+
+/**
+ * ✅ SAVE PROGRESS STATE - For resume functionality
+ */
+function saveProgress() {
+    try {
+        const progressData = {
+            resumeState: resumeState,
+            isFirstRunDone: isFirstRunDone,
+            stats: stats,
+            timestamp: new Date().toISOString()
+        };
+
+        fs.writeFileSync(CONFIG.PROGRESS_FILE, JSON.stringify(progressData, null, 2));
+        console.log(`   💾 Progress saved to ${CONFIG.PROGRESS_FILE}`);
+
+        // Save URL cache
+        const cacheData = {
+            urls: Array.from(allScrapedUrls),
+            count: allScrapedUrls.size,
+            timestamp: new Date().toISOString()
+        };
+
+        fs.writeFileSync(CONFIG.CACHE_FILE, JSON.stringify(cacheData, null, 2));
+        console.log(`   💾 Cache saved: ${allScrapedUrls.size} URLs`);
+
+    } catch (e) {
+        console.error(`   ⚠️ Failed to save progress: ${e.message}`);
+    }
+}
+
+/**
+ * ✅ LOAD PROGRESS STATE - Resume from last position
+ */
+function loadProgress() {
+    try {
+        // Load progress state
+        if (fs.existsSync(CONFIG.PROGRESS_FILE)) {
+            const progressData = JSON.parse(fs.readFileSync(CONFIG.PROGRESS_FILE, 'utf8'));
+
+            resumeState = progressData.resumeState || resumeState;
+            isFirstRunDone = progressData.isFirstRunDone || false;
+
+            // Restore stats
+            if (progressData.stats) {
+                Object.assign(stats, progressData.stats);
+            }
+
+            const timeSince = progressData.timestamp
+                ? Math.round((Date.now() - new Date(progressData.timestamp).getTime()) / 1000 / 60)
+                : 'unknown';
+
+            console.log(`\n🔄 RESUME MODE ACTIVATED`);
+            console.log(`   📍 Last position: Query ${resumeState.currentQueryIndex + 1}/${CONFIG.query_variations.length}`);
+            if (resumeState.inHistoricalMode) {
+                console.log(`   📅 Historical mode: Year index ${resumeState.currentYearIndex}`);
+            }
+            console.log(`   ⏱️  Last saved: ${timeSince} minutes ago`);
+            console.log(`   📊 Stats: ${stats.totalScraped} posts, ${stats.cycleCount} cycles\n`);
+        }
+
+        // Load URL cache
+        if (fs.existsSync(CONFIG.CACHE_FILE)) {
+            const cacheData = JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, 'utf8'));
+
+            allScrapedUrls = new Set(cacheData.urls || []);
+            console.log(`   ✅ Loaded ${allScrapedUrls.size} cached URLs\n`);
+        }
+
+    } catch (e) {
+        console.error(`   ⚠️ Failed to load progress: ${e.message}`);
+        console.log(`   ℹ️  Starting fresh...`);
+    }
+}
+
+/**
+ * ✅ CLEAR PROGRESS STATE - Start fresh
+ */
+function clearProgress() {
+    try {
+        if (fs.existsSync(CONFIG.PROGRESS_FILE)) {
+            fs.unlinkSync(CONFIG.PROGRESS_FILE);
+            console.log(`   🗑️  Progress file cleared`);
+        }
+
+        resumeState = {
+            currentQueryIndex: 0,
+            currentYearIndex: 0,
+            inHistoricalMode: false,
+            lastSavedAt: null
+        };
+
+    } catch (e) {
+        console.error(`   ⚠️ Failed to clear progress: ${e.message}`);
     }
 }
 
@@ -4688,10 +4796,20 @@ async function runJob() {
         }
 
         console.log("✅ Login sukses. Memulai scraping...\n");
-        
+
         let totalScraped = 0;
-        
-        for (let i = 0; i < CONFIG.query_variations.length; i++) {
+
+        // ✅ RESUME: Start from last position
+        const startQueryIndex = resumeState.currentQueryIndex || 0;
+        if (startQueryIndex > 0) {
+            console.log(`🔄 RESUMING from Query ${startQueryIndex + 1}/${CONFIG.query_variations.length}\n`);
+        }
+
+        for (let i = startQueryIndex; i < CONFIG.query_variations.length; i++) {
+            // ✅ UPDATE PROGRESS STATE
+            resumeState.currentQueryIndex = i;
+            resumeState.lastSavedAt = new Date().toISOString();
+
             const currentQuery = CONFIG.query_variations[i];
             console.log(`\n${"━".repeat(70)}`);
             console.log(`🎯 Query ${i + 1}/${CONFIG.query_variations.length}: "${currentQuery}"`);
@@ -4707,26 +4825,45 @@ async function runJob() {
                 // ========== SCRAPE HISTORICAL DATA (HANYA FIRST RUN) ==========
                 if (!isFirstRunDone && CONFIG.USE_DATE_FILTER && CONFIG.FILTER_YEARS.length > 0) {
                     console.log(`📚 MODE: Scraping historical data (${CONFIG.FILTER_YEARS.join(', ')})`);
-                    
-                    for (let yearIndex = 0; yearIndex < CONFIG.FILTER_YEARS.length; yearIndex++) {
+
+                    // ✅ RESUME: Update mode
+                    resumeState.inHistoricalMode = true;
+
+                    // ✅ RESUME: Start from last year index
+                    const startYearIndex = resumeState.currentYearIndex || 0;
+                    if (startYearIndex > 0) {
+                        console.log(`🔄 Resuming from year index ${startYearIndex + 1}/${CONFIG.FILTER_YEARS.length}`);
+                    }
+
+                    for (let yearIndex = startYearIndex; yearIndex < CONFIG.FILTER_YEARS.length; yearIndex++) {
+                        // ✅ UPDATE YEAR INDEX
+                        resumeState.currentYearIndex = yearIndex;
+
                         const year = CONFIG.FILTER_YEARS[yearIndex];
                         console.log(`\n📅 Processing year: ${year}`);
-                        
+
                         if (yearIndex > 0) {
                             await clearDateFilter(queryPage);
                             await humanDelay(2000, 3000);
                         }
-                        
+
                         await clickAllTab(queryPage);
                         await humanDelay(1500, 2500);
-                        
+
                         const scraped = await scrapeFacebookSearch(queryPage, currentQuery, CONFIG.max_posts_historical, year);
                         totalScraped += scraped;
-                        
+
+                        // ✅ SAVE PROGRESS after each year
+                        saveProgress();
+
                         if (yearIndex < CONFIG.FILTER_YEARS.length - 1) {
                             await humanDelay(3000, 5000);
                         }
                     }
+
+                    // ✅ RESET year index after historical done
+                    resumeState.currentYearIndex = 0;
+                    resumeState.inHistoricalMode = false;
                     
                     console.log(`\n🧹 Clearing last year filter...`);
                     await clearDateFilter(queryPage);
@@ -4737,13 +4874,19 @@ async function runJob() {
                 
                 // ========== SCRAPE RECENT POSTS (ALWAYS RUN) ==========
                 console.log(`\n📰 MODE: Scraping RECENT POSTS (real-time updates)`);
-                
+
+                // ✅ RESET historical mode flag
+                resumeState.inHistoricalMode = false;
+
                 await enableRecentPosts(queryPage);
                 await humanDelay(2000, 3000);
-                
+
                 const recentScraped = await scrapeFacebookSearch(queryPage, currentQuery, CONFIG.max_posts_recent, null);
                 totalScraped += recentScraped;
-                
+
+                // ✅ SAVE PROGRESS after query complete
+                saveProgress();
+
             } catch (pageError) {
                 console.error(`❌ Error di query "${currentQuery}": ${pageError.message}`);
             } finally {
@@ -4758,7 +4901,11 @@ async function runJob() {
                 await new Promise(resolve => setTimeout(resolve, jeda));
             }
         }
-        
+
+        // ✅ CLEAR PROGRESS after all queries complete
+        console.log(`\n🗑️  Clearing resume state (all queries completed)...`);
+        clearProgress();
+
         if (!isFirstRunDone) {
             isFirstRunDone = true;
             fs.writeFileSync(CONFIG.FIRST_RUN_FILE, new Date().toISOString());
@@ -5324,6 +5471,9 @@ async function main() {
     console.log("╚═══════════════════════════════════════════════════════════════════╝");
     console.log();
 
+    // ✅ LOAD RESUME STATE
+    loadProgress();
+
     if (fs.existsSync(CONFIG.FIRST_RUN_FILE)) {
         isFirstRunDone = true;
         const timestamp = fs.readFileSync(CONFIG.FIRST_RUN_FILE, 'utf8');
@@ -5331,7 +5481,7 @@ async function main() {
         console.log(`   Skipping historical data, will only scrape RECENT posts.\n`);
     }
 
-    // Load existing URLs from ALL CSV files
+    // Load existing URLs from ALL CSV files (if cache not loaded)
     const allCsvFiles = [
         ...CONFIG.FILTER_YEARS.map(y => getCSVFilename(y)),
         getCSVFilename(null)
@@ -5415,12 +5565,16 @@ async function main() {
     }
 }  // ✅ Closing bracket main() tetap ada
 
-// ✅ MODIFIED: Graceful shutdown with cleanup
+// ✅ MODIFIED: Graceful shutdown with cleanup + RESUME STATE
 process.on('SIGINT', async () => {
     console.log("\n\n⚠️ Shutdown signal received. Cleaning up...");
-    
+
     log('WARN', 'Graceful shutdown initiated');
-    
+
+    // ✅ Save progress for resume
+    console.log("💾 Saving progress for resume...");
+    saveProgress();
+
     // Save stats
     console.log("📊 Saving statistics...");
     saveStats();
@@ -5428,16 +5582,17 @@ process.on('SIGINT', async () => {
     // ✅ Save final strategy report
     console.log("📊 Saving final strategy report...");
     saveStrategyReport();
-    
+
     // Final backup
     if (CONFIG.BACKUP_ENABLED) {
         console.log("💾 Creating final backup...");
         await createBackup();
     }
-    
+
     log('INFO', 'Shutdown complete');
     console.log("✅ Cleanup complete. Goodbye!\n");
-    
+    console.log("💡 TIP: Run the script again to resume from this position!\n");
+
     process.exit(0);
 });
 
@@ -5448,11 +5603,12 @@ process.on('uncaughtException', (error) => {
         error: error.message,
         stack: error.stack
     });
-    
+
     // Save state before crash
-    saveCache(true);
+    console.log("💾 Saving state before crash...");
+    saveProgress();
     saveStats();
-    
+
     process.exit(1);
 });
 

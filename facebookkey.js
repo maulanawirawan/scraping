@@ -2934,14 +2934,17 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
             // ✅ Scroll to element (lanjut proses normal)
             await postEl.scrollIntoViewIfNeeded({ behavior: 'smooth' }).catch(() => {});
             await page.waitForTimeout(500);
-            
+
+            // ✅ VISUAL HIGHLIGHT: Mark post as being processed
+            await highlightPost(page, postEl, 'start');
+
         } catch (checkError) {
             console.warn(`      ⚠️ Error checking element: ${checkError.message.substring(0, 50)}`);
             skipReasons.otherErrors++;
             continue;
         }
 
-                
+
                 // ========== ✅ QUICK URL CHECK FIRST ==========
                 const quickResult = await quickExtractUrl(postEl);
 
@@ -3684,7 +3687,7 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
 
                     postsData.push(post);
                     newPostsInLoop++;
-                    
+
                     allScrapedUrls.add(postUrl);
                     if (postId) allScrapedUrls.add(`postid:${postId}`);
                     if (actualImageUrl !== "N/A") {
@@ -3692,9 +3695,16 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
                         if (photoId) allScrapedUrls.add(`photoid:${photoId}`);
                     }
                     allScrapedUrls.add(`hash:${finalHash}`);
-                    
+
                     const statusLine = `   ✅ [${postsData.length}/${maxPosts}] ${authorName.padEnd(30)} | R:${String(reactions_total).padStart(4)} C:${String(comments).padStart(4)} S:${String(shares).padStart(4)}${views > 0 ? ` V:${String(views).padStart(6)}` : ''}`;
                     console.log(statusLine);
+
+                    // ✅ REALTIME SAVE: Save immediately after extraction
+                    const csvFilename = getCSVFilename(filterYear);
+                    await savePostRealtime(post, csvFilename);
+
+                    // ✅ VISUAL HIGHLIGHT: Mark as successfully saved
+                    await highlightPost(page, postEl, 'success');
 
                     if (postsData.length >= maxPosts) break;
                     
@@ -3704,6 +3714,9 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
                     skipReasons.otherErrors++;
                     console.warn(`      ❌ ERROR processing post ${i + 1}: ${error.message}`);
                     console.warn(`         Stack: ${error.stack?.substring(0, 200)}`);
+
+                    // ✅ VISUAL HIGHLIGHT: Mark as error
+                    await highlightPost(page, postEl, 'error');
                 }
             }
             
@@ -3712,11 +3725,12 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
             // ========== SCROLL TO LOAD MORE POSTS ==========
             try {
                 if (page.isClosed()) break;
-                
+
                 await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
                 console.log(`   > Scrolling... (${postsData.length}/${maxPosts} posts)`);
-                await page.waitForTimeout(5000);
-                await page.waitForLoadState('networkidle').catch(() => {});
+                await page.waitForTimeout(3000);
+                // ✅ Changed: Use domcontentloaded instead of networkidle for better responsiveness
+                await page.waitForLoadState('domcontentloaded').catch(() => {});
                 await page.waitForTimeout(CONFIG.JEDA_SCROLL_DETIK * 1000 + Math.random() * 2000);
             } catch (scrollError) {
                 console.warn(`       ⚠️ Scroll error: ${scrollError.message}`);
@@ -3780,17 +3794,99 @@ async function scrapeFacebookSearch(page, query, maxPosts, filterYear = null) {
 }
 
 /**
+ * ✅ REALTIME SAVE: Save single post immediately to CSV
+ */
+async function savePostRealtime(post, postFile) {
+    try {
+        const fileExists = fs.existsSync(postFile);
+
+        // Write BOM untuk Excel compatibility (only if new file)
+        if (!fileExists) {
+            fs.writeFileSync(postFile, '\ufeff');
+        }
+
+        const postWriter = createObjectCsvWriter({
+            path: postFile,
+            header: [
+                {id: 'author', title: 'author'},
+                {id: 'location', title: 'location'},
+                {id: 'timestamp', title: 'timestamp'},
+                {id: 'timestamp_iso', title: 'timestamp_iso'},
+                {id: 'post_url', title: 'post_url'},
+                {id: 'share_url', title: 'share_url'},
+                {id: 'content_text', title: 'content_text'},
+                {id: 'image_url', title: 'image_url'},
+                {id: 'video_url', title: 'video_url'},
+                {id: 'image_source', title: 'image_source'},
+                {id: 'video_source', title: 'video_source'},
+                {id: 'reactions_total', title: 'reactions_total'},
+                {id: 'comments', title: 'comments'},
+                {id: 'shares', title: 'shares'},
+                {id: 'views', title: 'views'},
+                {id: 'query_used', title: 'query_used'},
+                {id: 'filter_year', title: 'filter_year'},
+                {id: 'scraped_at', title: 'scraped_at'},
+                {id: 'updated_at', title: 'updated_at'}
+            ],
+            append: fileExists,
+            alwaysQuote: true,
+            encoding: 'utf8',
+            fieldDelimiter: ',',
+        });
+
+        await postWriter.writeRecords([post]);
+        fs.chmodSync(postFile, CONFIG.FILE_PERMISSIONS);
+
+        console.log(`      💾 Realtime saved to ${postFile}`);
+    } catch (error) {
+        console.warn(`      ⚠️ Realtime save error: ${error.message}`);
+    }
+}
+
+/**
+ * ✅ ADD VISUAL HIGHLIGHT: Highlight post being processed in browser
+ */
+async function highlightPost(page, postEl, action = 'start') {
+    try {
+        if (action === 'start') {
+            await postEl.evaluate(el => {
+                el.style.border = '4px solid #00ff00';
+                el.style.backgroundColor = 'rgba(0, 255, 0, 0.1)';
+                el.style.transition = 'all 0.3s ease';
+            });
+        } else if (action === 'success') {
+            await postEl.evaluate(el => {
+                el.style.border = '4px solid #0080ff';
+                el.style.backgroundColor = 'rgba(0, 128, 255, 0.1)';
+            });
+            await page.waitForTimeout(500);
+            await postEl.evaluate(el => {
+                el.style.border = '';
+                el.style.backgroundColor = '';
+            });
+        } else if (action === 'error') {
+            await postEl.evaluate(el => {
+                el.style.border = '4px solid #ff0000';
+                el.style.backgroundColor = 'rgba(255, 0, 0, 0.1)';
+            });
+        }
+    } catch (e) {
+        // Ignore highlight errors
+    }
+}
+
+/**
  * ✅ FIXED: Save data dengan UTF-8 encoding + BOM + PROPER CSV ESCAPING
  */
 async function saveData(posts, postFile) {
     if (posts.length > 0) {
         const fileExists = fs.existsSync(postFile);
-        
+
         // Write BOM untuk Excel compatibility
         if (!fileExists) {
             fs.writeFileSync(postFile, '\ufeff');
         }
-        
+
         const postWriter = createObjectCsvWriter({
             path: postFile,
             header: [
@@ -3819,10 +3915,10 @@ async function saveData(posts, postFile) {
             encoding: 'utf8',
             fieldDelimiter: ',', // ✅ Explicit comma delimiter
         });
-        
+
         await postWriter.writeRecords(posts);
         fs.chmodSync(postFile, CONFIG.FILE_PERMISSIONS);
-        
+
         console.log(`✅ Data disimpan ke ${postFile}. Total: ${posts.length} posts`);
         log('INFO', `Data saved to ${postFile}`, { count: posts.length });
     }
@@ -4589,7 +4685,7 @@ async function runJob() {
             
             try {
                 const searchUrl = `https://www.facebook.com/search/posts/?q=${encodeURIComponent(currentQuery)}`;
-                await queryPage.goto(searchUrl, { waitUntil: 'networkidle', timeout: 60000 });
+                await queryPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
                 await queryPage.waitForTimeout(3000);
                 
                 // ========== SCRAPE HISTORICAL DATA (HANYA FIRST RUN) ==========

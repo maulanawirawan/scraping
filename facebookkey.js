@@ -44,7 +44,7 @@ const CONFIG = {
     COMPLEMENT_WITH_HTML: true,    // Use HTML to fill missing fields
 
     // ✅ Comment Extraction Settings
-    EXTRACT_COMMENTS: true,        // Enable comment extraction
+    EXTRACT_COMMENTS: false,       // ⚠️ DISABLED: Enable after capturing comment GraphQL
     MAX_COMMENTS_PER_POST: 50,     // Max parent comments to extract
     MAX_NESTED_REPLIES: 10,        // Max nested replies per parent comment
     COMMENT_CSV_FILENAME: "comments.csv",  // Separate CSV for comments
@@ -1446,19 +1446,17 @@ function parseCommentsFromGraphQL(graphqlResponse, postUrl, postAuthor) {
  */
 async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
     const comments = [];
+    let dialogOpened = false;
 
     try {
         console.log(`      💬 HTML: Starting comment extraction...`);
 
         // Step 1: Click comment button to open dialog
         const commentButtonSelectors = [
-            'span.xkrqix3.x1sur9pj:has-text("comments")',
-            'div.x1i10hfl[role="button"]:has(span.xkrqix3.x1sur9pj:has-text("comments"))',
-            'div[role="button"]:has(span:has-text("comments"))',
-            'span:has-text("comments")',
+            'span.xkrqix3.x1sur9pj:has-text("comment")',
+            'span:has-text("comment")',
+            'div[role="button"]:has(span:has-text("comment"))',
         ];
-
-        let dialogOpened = false;
 
         for (const selector of commentButtonSelectors) {
             try {
@@ -1468,7 +1466,7 @@ async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
                     await commentBtn.scrollIntoViewIfNeeded().catch(() => {});
                     await page.waitForTimeout(500);
 
-                    const parentButton = postEl.locator('div[role="button"]:has(span:has-text("comments"))').first();
+                    const parentButton = postEl.locator('div[role="button"]:has(span:has-text("comment"))').first();
 
                     if (await parentButton.count() > 0) {
                         await parentButton.click({ timeout: 5000 });
@@ -1478,6 +1476,7 @@ async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
                         const dialog = page.locator('div[role="dialog"]').first();
                         if (await dialog.count() > 0) {
                             dialogOpened = true;
+                            console.log(`      ✅ Comment dialog opened`);
                             break;
                         }
                     }
@@ -1498,11 +1497,10 @@ async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
 
         // Step 3: Scroll in dialog to load more comments (up to 50)
         const dialog = page.locator('div[role="dialog"]').first();
-        const scrollContainer = dialog.locator('div[role="article"]').first();
 
         let previousCount = 0;
         let scrollAttempts = 0;
-        const maxScrollAttempts = 10; // Limit scrolling attempts
+        const maxScrollAttempts = 10;
 
         while (scrollAttempts < maxScrollAttempts) {
             const currentComments = await dialog.locator('div[role="article"][aria-label*="Comment by"]').count();
@@ -1515,7 +1513,7 @@ async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
             if (currentComments === previousCount) {
                 scrollAttempts++;
             } else {
-                scrollAttempts = 0; // Reset if we found new comments
+                scrollAttempts = 0;
                 previousCount = currentComments;
             }
 
@@ -1533,6 +1531,8 @@ async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
         // Step 4: Extract visible comments
         const commentContainers = await dialog.locator('div[role="article"][aria-label*="Comment by"]').all();
         const maxComments = Math.min(commentContainers.length, CONFIG.MAX_COMMENTS_PER_POST);
+
+        console.log(`      📊 Found ${commentContainers.length} comment containers, extracting ${maxComments}...`);
 
         for (let i = 0; i < maxComments; i++) {
             const commentEl = commentContainers[i];
@@ -1633,18 +1633,6 @@ async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
             }
         }
 
-        // Close dialog
-        try {
-            const closeBtn = dialog.locator('div[aria-label="Close"]').first();
-            if (await closeBtn.count() > 0) {
-                await closeBtn.click({ timeout: 3000 });
-                await page.waitForTimeout(1000);
-            }
-        } catch (e) {
-            // Press Escape as fallback
-            await page.keyboard.press('Escape').catch(() => {});
-        }
-
         console.log(`      💬 HTML: Extracted ${comments.length} comments`);
         trackStrategy('comments', 'html_extracted');
 
@@ -1654,6 +1642,51 @@ async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
         console.warn(`      ⚠️ HTML comment extraction error: ${err.message}`);
         trackStrategy('comments', 'html_extraction_error');
         return [];
+    } finally {
+        // ✅ CRITICAL: Always close dialog, even if there's an error
+        if (dialogOpened) {
+            try {
+                console.log(`      🔄 Closing comment dialog...`);
+
+                // Strategy 1: Close button
+                const closeBtn = page.locator('div[role="dialog"] div[aria-label="Close"]').first();
+                if (await closeBtn.count() > 0) {
+                    await closeBtn.click({ timeout: 3000 });
+                    await page.waitForTimeout(1000);
+                    console.log(`      ✅ Dialog closed via Close button`);
+                } else {
+                    // Strategy 2: Press Escape
+                    await page.keyboard.press('Escape');
+                    await page.waitForTimeout(1000);
+                    console.log(`      ✅ Dialog closed via Escape key`);
+                }
+
+                // Verify dialog is closed
+                const stillOpen = await page.locator('div[role="dialog"]').count();
+                if (stillOpen > 0) {
+                    // Strategy 3: Click outside dialog (backdrop)
+                    await page.mouse.click(10, 10);
+                    await page.waitForTimeout(500);
+
+                    // Strategy 4: Force Escape again
+                    await page.keyboard.press('Escape');
+                    await page.waitForTimeout(500);
+                    console.log(`      ⚠️ Dialog still open, forced close with multiple attempts`);
+                }
+
+            } catch (closeError) {
+                console.warn(`      ⚠️ Error closing dialog: ${closeError.message}`);
+                // Last resort: Press Escape multiple times
+                try {
+                    await page.keyboard.press('Escape');
+                    await page.waitForTimeout(300);
+                    await page.keyboard.press('Escape');
+                    await page.waitForTimeout(300);
+                } catch (e) {
+                    console.warn(`      ⚠️ Failed to force close dialog`);
+                }
+            }
+        }
     }
 }
 

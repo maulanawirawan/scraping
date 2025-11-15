@@ -1295,6 +1295,14 @@ async function main() {
             console.log(`🎯 Memulai Hashtag: #${hashtag} (${i + 1}/${CONFIG.target_hashtags.length})`);
             console.log(`${"=".repeat(60)}`);
 
+            // ========== CLEAR COMMENTS MEMORY (FRESH START PER HASHTAG) ==========
+            // Fix: Prevent stale comments from previous hashtags interfering with new scraping
+            const previousCommentsCount = allComments.size;
+            allComments.clear();
+            if (previousCommentsCount > 0) {
+                console.log(`   🗑️  Cleared ${previousCommentsCount} comments from previous hashtag (fresh start)`);
+            }
+
             // Save checkpoint at start of hashtag
             saveCheckpoint('discovery', hashtag, i, 60, 0);
 
@@ -2508,13 +2516,21 @@ async function processPostDirect(page, post, hashtag) {
                 comment_timestamp: unixToISO(c.comment_timestamp_unix),
                 comment_timestamp_wib: convertToWIB(unixToISO(c.comment_timestamp_unix)),
                 is_reply: c.parent_comment_pk ? "true" : "false",
-                parent_comment_author: c.parent_comment_pk 
+                parent_comment_author: c.parent_comment_pk
                     ? cleanTextForCSV(allComments.get(c.parent_comment_pk)?.comment_author || "")
                     : "",
                 scraped_at: now
             }));
-            
+
             await saveCommentsRealtime(commentsToSave);
+        } else if (comments > 0) {
+            // ========== WARNING: POST HAS COMMENTS BUT NONE CAPTURED ==========
+            console.log(`      ⚠️  WARNING: Post has ${comments} comments but 0 captured!`);
+            console.log(`      💡 Possible causes:`);
+            console.log(`         - Instagram rate limit (API not responding)`);
+            console.log(`         - Comment API endpoint changed`);
+            console.log(`         - Network timeout (try again later)`);
+            console.log(`      📊 Memory state: ${allComments.size} total comments in cache`);
         }
         
         post._processed_details = true;

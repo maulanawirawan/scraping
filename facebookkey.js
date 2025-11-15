@@ -1475,52 +1475,169 @@ async function extractCommentsFromDialog(page, postUrl, postAuthor) {
     try {
         console.log(`      💬 HTML: Extracting from opened dialog...`);
 
-        // Wait for comments to load
-        await page.waitForTimeout(2000);
-
-        // Scroll in dialog to load more comments (up to 50)
+        // ✅ STEP 1: Find dialog
         const dialog = page.locator('div[role="dialog"]').first();
 
-        let previousCount = 0;
-        let scrollAttempts = 0;
-        const maxScrollAttempts = 10;
+        if (await dialog.count() === 0) {
+            console.log(`      ⚠️  No dialog found!`);
+            return [];
+        }
 
-        while (scrollAttempts < maxScrollAttempts) {
-            const currentComments = await dialog.locator('div[role="article"][aria-label*="Comment by"]').count();
+        // ✅ STEP 2: Wait for dialog content to load
+        console.log(`      ⏳ Waiting for comments to load...`);
+        await page.waitForTimeout(3000); // Increased from 2000ms
 
-            if (currentComments >= CONFIG.MAX_COMMENTS_PER_POST) {
-                console.log(`      ℹ️  HTML: Reached max comments limit (${CONFIG.MAX_COMMENTS_PER_POST})`);
-                break;
-            }
+        // ✅ STEP 3: Wait for loading indicator to disappear
+        let loadingCheckAttempts = 0;
+        const maxLoadingChecks = 10;
 
-            if (currentComments === previousCount) {
-                scrollAttempts++;
+        while (loadingCheckAttempts < maxLoadingChecks) {
+            const isLoading = await dialog.locator(
+                'div[role="status"][data-visualcompletion="loading-state"][aria-label="Loading..."], ' +
+                'div[role="progressbar"]'
+            ).count() > 0;
+
+            if (isLoading) {
+                console.log(`      ⏳ Still loading... (${loadingCheckAttempts + 1}/${maxLoadingChecks})`);
+                await page.waitForTimeout(2000);
+                loadingCheckAttempts++;
             } else {
-                scrollAttempts = 0;
-                previousCount = currentComments;
-            }
-
-            // Scroll to load more
-            try {
-                await dialog.evaluate((el) => {
-                    el.scrollTop = el.scrollHeight;
-                });
-                await page.waitForTimeout(1500);
-            } catch (e) {
+                console.log(`      ✅ Loading complete!`);
                 break;
             }
         }
 
-        // Extract visible comments
-        const commentContainers = await dialog.locator('div[role="article"][aria-label*="Comment by"]').all();
+        await page.waitForTimeout(1500); // Extra settle time
+
+        // ✅ STEP 4: Scroll to load ALL comments
+        let previousCount = 0;
+        let sameCountTimes = 0;
+        const maxSameCount = 5;
+        let scrollAttempts = 0;
+        const maxScrollAttempts = 15; // Increased from 10
+
+        while (sameCountTimes < maxSameCount && scrollAttempts < maxScrollAttempts) {
+            scrollAttempts++;
+
+            // ✅ ROBUST SELECTOR: Try multiple patterns
+            const selectorStrategies = [
+                'div[role="article"][aria-label*="Comment by"]', // Strategy 1: Exact
+                'div[role="article"][aria-label*="comment"]', // Strategy 2: Lowercase
+                'div[role="article"]', // Strategy 3: Any article
+            ];
+
+            let currentCount = 0;
+            for (const selector of selectorStrategies) {
+                currentCount = await dialog.locator(selector).count();
+                if (currentCount > 0) {
+                    if (selectorStrategies.indexOf(selector) > 0) {
+                        console.log(`      ℹ️  Using fallback selector #${selectorStrategies.indexOf(selector) + 1}`);
+                    }
+                    break;
+                }
+            }
+
+            if (currentCount >= CONFIG.MAX_COMMENTS_PER_POST) {
+                console.log(`      ℹ️  Reached max comments limit (${CONFIG.MAX_COMMENTS_PER_POST})`);
+                break;
+            }
+
+            if (currentCount === previousCount) {
+                sameCountTimes++;
+                console.log(`      -> Same count (${sameCountTimes}/${maxSameCount}): ${currentCount} comments`);
+            } else {
+                sameCountTimes = 0;
+                console.log(`      -> Loaded: ${currentCount} comments (+${currentCount - previousCount})`);
+            }
+
+            previousCount = currentCount;
+
+            // Scroll to bottom
+            try {
+                await dialog.evaluate((el) => {
+                    el.scrollTop = el.scrollHeight;
+                });
+                await page.waitForTimeout(2000); // Increased from 1500ms
+            } catch (e) {
+                console.log(`      ⚠️  Scroll error: ${e.message.substring(0, 30)}`);
+                break;
+            }
+
+            // Check for loading again after scroll
+            const loadingAfterScroll = await dialog.locator(
+                'div[role="status"][data-visualcompletion="loading-state"]'
+            ).count() > 0;
+
+            if (loadingAfterScroll) {
+                console.log(`      ⏳ Loading more comments...`);
+                await page.waitForTimeout(3000);
+            }
+        }
+
+        // ✅ STEP 5: Extract visible comments with MULTIPLE selector strategies
+        let commentContainers = [];
+
+        const containerSelectors = [
+            'div[role="article"][aria-label*="Comment by"]', // Priority 1
+            'div[role="article"][aria-label*="comment"]', // Priority 2 (case-insensitive)
+            'div[role="article"]', // Priority 3 (any article in dialog)
+        ];
+
+        for (const selector of containerSelectors) {
+            commentContainers = await dialog.locator(selector).all();
+
+            if (commentContainers.length > 0) {
+                console.log(`      ✅ Found ${commentContainers.length} comments with selector: ${selector.substring(0, 50)}...`);
+                break;
+            } else {
+                console.log(`      -> Selector failed: ${selector.substring(0, 50)}...`);
+            }
+        }
+
+        if (commentContainers.length === 0) {
+            console.log(`      ⚠️  No comment containers found after trying all selectors!`);
+            console.log(`      📸 Debug: Saving dialog HTML...`);
+
+            // Save dialog HTML for debugging
+            try {
+                const dialogHTML = await dialog.evaluate(el => el.outerHTML).catch(() => '<no HTML>');
+                const debugFile = `./debug_dialog_${Date.now()}.html`;
+                fs.writeFileSync(debugFile, dialogHTML);
+                console.log(`      📁 Dialog HTML saved to: ${debugFile}`);
+            } catch (e) {
+                console.log(`      ⚠️  Could not save debug HTML`);
+            }
+
+            return [];
+        }
+
         const maxComments = Math.min(commentContainers.length, CONFIG.MAX_COMMENTS_PER_POST);
 
-        console.log(`      📊 Found ${commentContainers.length} comment containers, extracting ${maxComments}...`);
+        console.log(`      📊 Extracting ${maxComments} comments from ${commentContainers.length} total...`);
 
         for (let i = 0; i < maxComments; i++) {
             const commentEl = commentContainers[i];
 
             try {
+                // ✅ VISUAL HIGHLIGHT: Scroll into view & highlight current comment
+                try {
+                    await commentEl.evaluate(el => {
+                        el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                    });
+                    await page.waitForTimeout(300);
+
+                    // Add visual border (red like in user's HTML example)
+                    await commentEl.evaluate(el => {
+                        el.style.border = '3px solid #ff0000';
+                        el.style.backgroundColor = '#fff3cd';
+                        el.style.transition = 'all 0.3s ease';
+                    });
+
+                    await page.waitForTimeout(200); // Brief flash for visibility
+                } catch (highlightErr) {
+                    // Non-critical, continue
+                }
+
                 const comment = {
                     post_url: postUrl,
                     post_author: postAuthor,
@@ -1536,10 +1653,26 @@ async function extractCommentsFromDialog(page, postUrl, postAuthor) {
                     data_source: 'html'
                 };
 
-                // Extract author
-                const authorEl = commentEl.locator('a[role="link"] span.x193iq5w.xeuugli').first();
-                if (await authorEl.count() > 0) {
-                    comment.comment_author = (await authorEl.textContent()).trim();
+                // ✅ EXTRACT AUTHOR with MULTIPLE selectors (from user's HTML)
+                const authorSelectors = [
+                    // Priority 1: EXACT from user HTML
+                    'div.xwib8y2.xpdmqnj.x1g0dm76.x1y1aw1k span.xt0psk2 span.xjp7ctv a span.x3nfvp2 span.x193iq5w.xeuugli',
+                    // Priority 2: Shorter path
+                    'a[role="link"] span.x193iq5w.xeuugli.x13faqbe.x1vvkbs',
+                    // Priority 3: Generic
+                    'a[role="link"] span.x193iq5w.xeuugli',
+                    'a[role="link"] span.x193iq5w',
+                ];
+
+                for (const selector of authorSelectors) {
+                    const authorEl = commentEl.locator(selector).first();
+                    if (await authorEl.count() > 0) {
+                        const authorText = await authorEl.textContent();
+                        if (authorText && authorText.trim()) {
+                            comment.comment_author = authorText.trim();
+                            break;
+                        }
+                    }
                 }
 
                 // Extract author URL
@@ -1551,16 +1684,49 @@ async function extractCommentsFromDialog(page, postUrl, postAuthor) {
                     }
                 }
 
-                // Extract text
-                const textDivs = await commentEl.locator('div.x1lliihq.xjkvuk6.x1iorvi4 div[dir="auto"]').all();
+                // ✅ EXTRACT TEXT with MULTIPLE selectors (from user's HTML)
+                const textSelectors = [
+                    // Priority 1: EXACT from user HTML
+                    'div.x1lliihq.xjkvuk6.x1iorvi4 span[dir="auto"][lang="id-ID"] div.xdj266r div[dir="auto"]',
+                    // Priority 2: Without lang attribute (for English/other)
+                    'div.x1lliihq.xjkvuk6.x1iorvi4 span[dir="auto"] div.xdj266r div[dir="auto"]',
+                    // Priority 3: Direct to final div
+                    'div.x1lliihq.xjkvuk6.x1iorvi4 div[dir="auto"][style*="text-align"]',
+                    // Priority 4: Original (broader)
+                    'div.x1lliihq.xjkvuk6.x1iorvi4 div[dir="auto"]',
+                ];
+
                 const textParts = [];
-                for (const div of textDivs) {
-                    const text = await div.textContent();
-                    if (text && text.trim()) {
-                        textParts.push(text.trim());
+                let textFound = false;
+
+                for (const selector of textSelectors) {
+                    const textDivs = await commentEl.locator(selector).all();
+
+                    if (textDivs.length > 0) {
+                        for (const div of textDivs) {
+                            const text = await div.textContent();
+                            const cleaned = text ? text.trim() : '';
+
+                            // Filter out UI elements
+                            if (cleaned.length > 1 &&
+                                !cleaned.match(/^\d+[mhdwy]$/i) && // Not timestamp like "1d"
+                                !cleaned.toLowerCase().includes('like') &&
+                                !cleaned.toLowerCase().includes('reply') &&
+                                !cleaned.toLowerCase().includes('see translation')) {
+                                textParts.push(cleaned);
+                            }
+                        }
+
+                        if (textParts.length > 0) {
+                            textFound = true;
+                            break; // Found text, stop trying selectors
+                        }
                     }
                 }
-                comment.comment_text = cleanTextForCSV(textParts.join(' '));
+
+                // Remove duplicates and join
+                const uniqueTexts = [...new Set(textParts)];
+                comment.comment_text = cleanTextForCSV(uniqueTexts.join(' '));
 
                 // Extract timestamp with retry
                 for (let retry = 0; retry <= CONFIG.COMMENT_HOVER_RETRY; retry++) {
@@ -1587,13 +1753,30 @@ async function extractCommentsFromDialog(page, postUrl, postAuthor) {
                     }
                 }
 
-                // Extract reactions
-                const reactionEl = commentEl.locator('span[aria-label*="reaction"]').first();
-                if (await reactionEl.count() > 0) {
-                    const ariaLabel = await reactionEl.getAttribute('aria-label');
-                    const match = ariaLabel?.match(/(\d+)/);
-                    if (match) {
-                        comment.comment_reactions = parseInt(match[1]);
+                // ✅ EXTRACT REACTIONS (from user's HTML)
+                const reactionSelectors = [
+                    // Priority 1: EXACT from user HTML (role="button" with aria-label)
+                    'div[aria-label*="reaction"][role="button"]',
+                    // Priority 2: Alternative formats
+                    'span[aria-label*="reaction"][role="button"]',
+                    'div[aria-label*="reaction"]',
+                    'span[aria-label*="reaction"]',
+                ];
+
+                for (const selector of reactionSelectors) {
+                    const reactionEl = commentEl.locator(selector).first();
+
+                    if (await reactionEl.count() > 0) {
+                        const ariaLabel = await reactionEl.getAttribute('aria-label');
+
+                        if (ariaLabel) {
+                            // Pattern: "15 reactions; see who reacted to this"
+                            const match = ariaLabel.match(/(\d+)\s+reactions?/i);
+                            if (match) {
+                                comment.comment_reactions = parseInt(match[1], 10);
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -1609,10 +1792,35 @@ async function extractCommentsFromDialog(page, postUrl, postAuthor) {
 
                 if (comment.comment_text) {
                     comments.push(comment);
+
+                    // ✅ CLEANUP HIGHLIGHT: Remove visual border after extraction
+                    try {
+                        await commentEl.evaluate(el => {
+                            el.style.border = '';
+                            el.style.backgroundColor = '';
+                        });
+                    } catch (cleanupErr) {
+                        // Non-critical
+                    }
+
+                    // Log progress
+                    if ((i + 1) % 10 === 0 || i + 1 === maxComments) {
+                        console.log(`      -> Extracted ${i + 1}/${maxComments} comments...`);
+                    }
+                } else {
+                    console.log(`      ⚠️  Comment ${i + 1}: No text, skipped`);
                 }
 
             } catch (err) {
-                console.warn(`      ⚠️ HTML: Error extracting comment ${i + 1}: ${err.message}`);
+                console.warn(`      ⚠️ HTML: Error extracting comment ${i + 1}: ${err.message.substring(0, 60)}`);
+
+                // Try to cleanup highlight even on error
+                try {
+                    await commentEl.evaluate(el => {
+                        el.style.border = '';
+                        el.style.backgroundColor = '';
+                    }).catch(() => {});
+                } catch (e) {}
             }
         }
 

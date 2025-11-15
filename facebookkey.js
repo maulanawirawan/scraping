@@ -86,6 +86,9 @@ const CONFIG = {
     SCREENSHOT_ON_ERROR: true,
     SCREENSHOT_DIR: './screenshots',
     MAX_SCREENSHOTS: 50,         // Keep last 50 screenshots only
+
+    // ✅ ZOOM SETTING - untuk timestamp dan layout issues
+    PAGE_ZOOM: 0.5,              // 50% zoom (0.5 = 50%, 1.0 = 100%)
 };
 
 let isJobRunning = false;
@@ -115,6 +118,20 @@ const strategyStats = {
 };
 
 let totalPostsProcessed = 0; // Track total posts untuk report
+
+/**
+ * ✅ Set page zoom level
+ */
+async function setPageZoom(page, zoomLevel = CONFIG.PAGE_ZOOM) {
+    try {
+        await page.evaluate((zoom) => {
+            document.body.style.zoom = zoom;
+        }, zoomLevel);
+        console.log(`🔍 Page zoom set to ${Math.round(zoomLevel * 100)}%`);
+    } catch (error) {
+        console.error('❌ Error setting page zoom:', error.message);
+    }
+}
 
 /**
  * ✅ Track strategy usage (HANYA LOG, TIDAK UBAH LOGIC)
@@ -2432,11 +2449,14 @@ async function extractVideoViewsFromPage(context, videoUrl) {
         
         // Open in new tab
         videoTab = await context.newPage();
-        
-        await videoTab.goto(videoUrl, { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 30000 
+
+        await videoTab.goto(videoUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
         }).catch(() => null);
+
+        // ✅ Set zoom level
+        await setPageZoom(videoTab);
         
         await videoTab.waitForTimeout(3000);
         
@@ -2529,11 +2549,14 @@ async function extractReelEngagementFromPage(context, reelUrl) {
         
         // Open in new tab
         reelTab = await context.newPage();
-        
-        await reelTab.goto(reelUrl, { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 30000 
+
+        await reelTab.goto(reelUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
         }).catch(() => null);
+
+        // ✅ Set zoom level
+        await setPageZoom(reelTab);
         
         await reelTab.waitForTimeout(3000);
         
@@ -5677,6 +5700,9 @@ async function runJob() {
 
         await page.goto("https://www.facebook.com/", { waitUntil: 'domcontentloaded' });
 
+        // ✅ Set zoom level untuk timestamp dan layout
+        await setPageZoom(page);
+
         let loginSuccess;
         try {
             await page.waitForSelector('a[aria-label="Home"]', { timeout: 5000 });
@@ -5715,10 +5741,14 @@ async function runJob() {
             console.log(`${"━".repeat(70)}`);
             
             const queryPage = await context.newPage();
-            
+
             try {
                 const searchUrl = `https://www.facebook.com/search/posts/?q=${encodeURIComponent(currentQuery)}`;
                 await queryPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+                // ✅ Set zoom level
+                await setPageZoom(queryPage);
+
                 await queryPage.waitForTimeout(3000);
                 
                 // ========== SCRAPE HISTORICAL DATA (HANYA FIRST RUN) ==========
@@ -5824,6 +5854,10 @@ async function runJob() {
 
         console.log("\n🔄 Memulai update engagement...");
         const updatePage = await context.newPage();
+
+        // ✅ Set zoom level
+        await setPageZoom(updatePage);
+
         try {
             // Update engagement (selalu jalan)
             await updateEngagement(updatePage, CONFIG.UPDATE_BATCH_SIZE);
@@ -5935,13 +5969,18 @@ async function processOrphanURLs(context, maxToProcess = 50) {
                 
                 // ✅ Open URL
                 page = await context.newPage();
-                const gotoResult = await page.goto(url, { 
-                    waitUntil: 'domcontentloaded', 
-                    timeout: 30000 
+                const gotoResult = await page.goto(url, {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 30000
                 }).catch((err) => {
                     console.log(`         ⚠️ Load error: ${err.message.substring(0, 40)}`);
                     return null;
                 });
+
+                // ✅ Set zoom level
+                if (gotoResult) {
+                    await setPageZoom(page);
+                }
                 
                 if (!gotoResult) {
                     console.log(`         ❌ Failed to load`);

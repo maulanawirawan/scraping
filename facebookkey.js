@@ -44,7 +44,7 @@ const CONFIG = {
     COMPLEMENT_WITH_HTML: true,    // Use HTML to fill missing fields
 
     // ✅ Comment Extraction Settings
-    EXTRACT_COMMENTS: false,       // ⚠️ DISABLED: Enable after capturing comment GraphQL
+    EXTRACT_COMMENTS: true,        // ✅ ENABLED: GraphQL comment extraction active
     MAX_COMMENTS_PER_POST: 50,     // Max parent comments to extract
     MAX_NESTED_REPLIES: 10,        // Max nested replies per parent comment
     COMMENT_CSV_FILENAME: "comments.csv",  // Separate CSV for comments

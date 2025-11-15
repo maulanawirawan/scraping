@@ -1146,11 +1146,19 @@ async function setupGraphQLInterceptor(page) {
 
                         console.log(`      💬 GraphQL Comment Response: ${commentEdges.length} comments (total: ${totalComments})`);
 
-                        // Store by post ID (extract from node ID)
-                        const postId = json.data.node.id;
-                        if (postId) {
-                            commentGraphQLResponseMap.set(postId, json);
+                        // ✅ Store by multiple ID formats for better matching
+                        const nodeId = json.data.node.id;
+                        const feedbackId = json.data.node?.comment_rendering_instance_for_feed_location?.id;
+                        const shareFbid = json.data.node?.parent_feedback?.share_fbid;
+
+                        // Store with all available ID formats
+                        const idFormats = [nodeId, feedbackId, shareFbid].filter(Boolean);
+
+                        for (const id of idFormats) {
+                            commentGraphQLResponseMap.set(id, json);
                         }
+
+                        console.log(`      📦 Stored comment response with IDs: ${idFormats.join(', ')}`);
 
                         trackStrategy('data_source', 'comment_graphql_intercepted');
                     }
@@ -1441,61 +1449,19 @@ function parseCommentsFromGraphQL(graphqlResponse, postUrl, postAuthor) {
 }
 
 /**
- * ✅ Extract Comments from HTML (Fallback method)
- * Based on facebookakon.js logic
+ * ✅ Extract Comments from Dialog (Helper function)
+ * Assumes dialog is already opened
  */
-async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
+async function extractCommentsFromDialog(page, postUrl, postAuthor) {
     const comments = [];
-    let dialogOpened = false;
 
     try {
-        console.log(`      💬 HTML: Starting comment extraction...`);
+        console.log(`      💬 HTML: Extracting from opened dialog...`);
 
-        // Step 1: Click comment button to open dialog
-        const commentButtonSelectors = [
-            'span.xkrqix3.x1sur9pj:has-text("comment")',
-            'span:has-text("comment")',
-            'div[role="button"]:has(span:has-text("comment"))',
-        ];
-
-        for (const selector of commentButtonSelectors) {
-            try {
-                const commentBtn = postEl.locator(selector).first();
-
-                if (await commentBtn.count() > 0) {
-                    await commentBtn.scrollIntoViewIfNeeded().catch(() => {});
-                    await page.waitForTimeout(500);
-
-                    const parentButton = postEl.locator('div[role="button"]:has(span:has-text("comment"))').first();
-
-                    if (await parentButton.count() > 0) {
-                        await parentButton.click({ timeout: 5000 });
-                        await page.waitForTimeout(3000);
-
-                        // Verify dialog opened
-                        const dialog = page.locator('div[role="dialog"]').first();
-                        if (await dialog.count() > 0) {
-                            dialogOpened = true;
-                            console.log(`      ✅ Comment dialog opened`);
-                            break;
-                        }
-                    }
-                }
-            } catch (e) {
-                continue;
-            }
-        }
-
-        if (!dialogOpened) {
-            console.log(`      ℹ️  HTML: No comment dialog opened`);
-            trackStrategy('comments', 'html_no_dialog');
-            return [];
-        }
-
-        // Step 2: Wait for comments to load
+        // Wait for comments to load
         await page.waitForTimeout(2000);
 
-        // Step 3: Scroll in dialog to load more comments (up to 50)
+        // Scroll in dialog to load more comments (up to 50)
         const dialog = page.locator('div[role="dialog"]').first();
 
         let previousCount = 0;
@@ -1528,7 +1494,7 @@ async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
             }
         }
 
-        // Step 4: Extract visible comments
+        // Extract visible comments
         const commentContainers = await dialog.locator('div[role="article"][aria-label*="Comment by"]').all();
         const maxComments = Math.min(commentContainers.length, CONFIG.MAX_COMMENTS_PER_POST);
 
@@ -1633,8 +1599,73 @@ async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
             }
         }
 
-        console.log(`      💬 HTML: Extracted ${comments.length} comments`);
-        trackStrategy('comments', 'html_extracted');
+        console.log(`      💬 HTML: Extracted ${comments.length} comments from dialog`);
+        trackStrategy('comments', 'html_extracted_from_dialog');
+
+        return comments;
+
+    } catch (err) {
+        console.warn(`      ⚠️ HTML comment extraction error from dialog: ${err.message}`);
+        trackStrategy('comments', 'html_dialog_extraction_error');
+        return [];
+    }
+}
+
+/**
+ * ✅ Extract Comments from HTML (Fallback method)
+ * Based on facebookakon.js logic
+ */
+async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
+    const comments = [];
+    let dialogOpened = false;
+
+    try {
+        console.log(`      💬 HTML: Starting comment extraction...`);
+
+        // Step 1: Click comment button to open dialog
+        const commentButtonSelectors = [
+            'span.xkrqix3.x1sur9pj:has-text("comment")',
+            'span:has-text("comment")',
+            'div[role="button"]:has(span:has-text("comment"))',
+        ];
+
+        for (const selector of commentButtonSelectors) {
+            try {
+                const commentBtn = postEl.locator(selector).first();
+
+                if (await commentBtn.count() > 0) {
+                    await commentBtn.scrollIntoViewIfNeeded().catch(() => {});
+                    await page.waitForTimeout(500);
+
+                    const parentButton = postEl.locator('div[role="button"]:has(span:has-text("comment"))').first();
+
+                    if (await parentButton.count() > 0) {
+                        await parentButton.click({ timeout: 5000 });
+                        await page.waitForTimeout(3000);
+
+                        // Verify dialog opened
+                        const dialog = page.locator('div[role="dialog"]').first();
+                        if (await dialog.count() > 0) {
+                            dialogOpened = true;
+                            console.log(`      ✅ Comment dialog opened`);
+                            break;
+                        }
+                    }
+                }
+            } catch (e) {
+                continue;
+            }
+        }
+
+        if (!dialogOpened) {
+            console.log(`      ℹ️  HTML: No comment dialog opened`);
+            trackStrategy('comments', 'html_no_dialog');
+            return [];
+        }
+
+        // Step 2: Extract comments from dialog
+        const extractedComments = await extractCommentsFromDialog(page, postUrl, postAuthor);
+        comments.push(...extractedComments);
 
         return comments;
 
@@ -1696,30 +1727,141 @@ async function extractCommentsFromHTML(page, postEl, postUrl, postAuthor) {
 async function extractAllCommentsHybrid(page, postEl, postUrl, postAuthor, postId) {
     if (!CONFIG.EXTRACT_COMMENTS) return [];
 
-    console.log(`      💬 Extracting comments (hybrid mode)...`);
+    console.log(`      💬 Extracting comments (hybrid mode, postId: ${postId})...`);
 
     let comments = [];
+    let graphqlResponse = null;
+    let dialogOpened = false;
 
-    // Try GraphQL first
-    if (CONFIG.PREFER_GRAPHQL && latestCommentGraphQLResponse) {
-        comments = parseCommentsFromGraphQL(latestCommentGraphQLResponse, postUrl, postAuthor);
+    // ✅ STEP 1: Try to open comment dialog to trigger GraphQL request
+    if (CONFIG.PREFER_GRAPHQL) {
+        console.log(`      🔍 Attempting to open comment dialog to trigger GraphQL...`);
 
-        if (comments.length > 0) {
-            console.log(`      ✅ Using GraphQL comments (${comments.length} total)`);
-            trackStrategy('comments', 'hybrid_graphql_success');
-            return comments;
+        const commentButtonSelectors = [
+            'span.xkrqix3.x1sur9pj:has-text("comment")',
+            'span:has-text("comment")',
+            'div[role="button"]:has(span:has-text("comment"))',
+        ];
+
+        for (const selector of commentButtonSelectors) {
+            try {
+                const commentBtn = postEl.locator(selector).first();
+
+                if (await commentBtn.count() > 0) {
+                    await commentBtn.scrollIntoViewIfNeeded().catch(() => {});
+                    await page.waitForTimeout(500);
+
+                    const parentButton = postEl.locator('div[role="button"]:has(span:has-text("comment"))').first();
+
+                    if (await parentButton.count() > 0) {
+                        await parentButton.click({ timeout: 5000 });
+                        console.log(`      ✅ Comment button clicked`);
+
+                        // Wait for GraphQL response to be captured
+                        await page.waitForTimeout(3000);
+
+                        // Verify dialog opened
+                        const dialog = page.locator('div[role="dialog"]').first();
+                        if (await dialog.count() > 0) {
+                            dialogOpened = true;
+                            console.log(`      ✅ Comment dialog opened`);
+                            break;
+                        }
+                    }
+                }
+            } catch (e) {
+                continue;
+            }
+        }
+
+        if (dialogOpened) {
+            console.log(`      ⏳ Waiting for GraphQL response (2s)...`);
+            await page.waitForTimeout(2000);
         }
     }
 
-    // Fallback to HTML if GraphQL didn't work
+    // ✅ STEP 2: Try to get GraphQL response specific to this post
+    if (CONFIG.PREFER_GRAPHQL) {
+        // Try multiple post ID formats to find matching response
+        const postIdVariants = [
+            postId,
+            `ZmVlZGJhY2s6${postId}`, // Feedback ID format
+            `UzpfSTEwMDA0NDQzODg4OTM3MTo${postId}`, // Story ID format
+        ];
+
+        // Log all stored IDs for debugging
+        if (commentGraphQLResponseMap.size > 0) {
+            const storedIds = Array.from(commentGraphQLResponseMap.keys());
+            console.log(`      📋 Stored comment response IDs: ${storedIds.slice(0, 5).join(', ')}${storedIds.length > 5 ? '...' : ''}`);
+        }
+
+        for (const variant of postIdVariants) {
+            if (commentGraphQLResponseMap.has(variant)) {
+                graphqlResponse = commentGraphQLResponseMap.get(variant);
+                console.log(`      ✅ Found GraphQL response for postId variant: ${variant}`);
+                break;
+            }
+        }
+
+        // Fallback to latest response if no specific match
+        if (!graphqlResponse && latestCommentGraphQLResponse) {
+            console.log(`      ℹ️  Using latest GraphQL response (no post-specific match)`);
+            graphqlResponse = latestCommentGraphQLResponse;
+        }
+
+        if (graphqlResponse) {
+            comments = parseCommentsFromGraphQL(graphqlResponse, postUrl, postAuthor);
+
+            if (comments.length > 0) {
+                console.log(`      ✅ Using GraphQL comments (${comments.length} total)`);
+                trackStrategy('comments', 'hybrid_graphql_success');
+
+                // Close dialog before returning
+                if (dialogOpened) {
+                    try {
+                        await page.keyboard.press('Escape');
+                        await page.waitForTimeout(300);
+                    } catch (e) {
+                        // Ignore
+                    }
+                }
+
+                return comments;
+            } else {
+                console.log(`      ⚠️  GraphQL response found but no comments parsed`);
+            }
+        } else {
+            console.log(`      ℹ️  No GraphQL response available (map size: ${commentGraphQLResponseMap.size})`);
+        }
+    }
+
+    // ✅ STEP 3: Fallback to HTML if GraphQL didn't work
     if (CONFIG.COMPLEMENT_WITH_HTML) {
         console.log(`      ℹ️  GraphQL comments not available, trying HTML extraction...`);
-        comments = await extractCommentsFromHTML(page, postEl, postUrl, postAuthor);
+
+        // If dialog is already opened from GraphQL attempt, use it
+        // Otherwise, extractCommentsFromHTML will try to open it
+        if (!dialogOpened) {
+            comments = await extractCommentsFromHTML(page, postEl, postUrl, postAuthor);
+        } else {
+            // Dialog already opened, just extract from it
+            comments = await extractCommentsFromDialog(page, postUrl, postAuthor);
+        }
 
         if (comments.length > 0) {
             console.log(`      ✅ Using HTML comments (${comments.length} total)`);
             trackStrategy('comments', 'hybrid_html_fallback');
             return comments;
+        }
+    }
+
+    // Close dialog if still open
+    if (dialogOpened) {
+        try {
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(300);
+        } catch (e) {
+            // Ignore
         }
     }
 
